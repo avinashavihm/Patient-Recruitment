@@ -1,8 +1,9 @@
 # app/routers/run.py
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
 from datetime import datetime
+import json
 
 from ..config import settings
 from ..utils.fileio import ensure_dirs
@@ -17,13 +18,14 @@ async def run_pipeline_v3(
     patients_xlsx: UploadFile = File(..., description="Patients.xlsx (no Site_ID)"),
     mapping_xlsx: UploadFile = File(..., description="Patient↔Site mapping.xlsx"),
     site_history_xlsx: UploadFile = File(..., description="Site history.xlsx"),
+    return_json: bool = False,  # Optional query parameter to return JSON instead of file
 ):
     """
     Version 3 pipeline endpoint:
       - Accepts 4 files (PDF + 3 xlsx)
       - Calls the v3 pipeline to evaluate eligibility in 100-row batches
       - Computes site ranking (Option A)
-      - Returns a 4-sheet XLSX as a downloadable file
+      - Returns a 4-sheet XLSX as a downloadable file or JSON with metadata
     """
     ensure_dirs()
 
@@ -48,7 +50,7 @@ async def run_pipeline_v3(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
 
-    # Persist output to disk and return as file (keeps behavior similar to previous version)
+    # Persist output to disk
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_name = f"eligibility_results_v3_{ts}.xlsx"
     out_path = Path(settings.OUTPUT_DIR) / out_name
@@ -57,16 +59,24 @@ async def run_pipeline_v3(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to write XLSX output: {e}")
 
-    # Optional: you can log meta here if you have a logger (errors, counts, etc.)
-    # Example:
-    # if meta.get("errors"):
-    #     for err in meta["errors"]:
-    #         logger.warning(f"Batch error: {err}")
+    # If JSON response requested, return metadata with file as base64
+    if return_json:
+        import base64
+        file_base64 = base64.b64encode(xlsx_bytes).decode('utf-8')
+        return JSONResponse({
+            "filename": out_name,
+            "file_data": file_base64,
+            "metadata": meta,
+        })
 
-    return FileResponse(
+    # Return file with metadata in headers
+    response = FileResponse(
         path=str(out_path),
         filename=out_name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    # Add metadata to headers (JSON-encoded)
+    response.headers["X-Metadata"] = json.dumps(meta)
+    return response
 
 
