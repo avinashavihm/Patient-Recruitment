@@ -52,9 +52,21 @@ export const runPipeline = async (files, onProgress) => {
 
 export const checkHealth = async () => {
   try {
-    const response = await api.get('/health');
+    // Use a shorter timeout for health checks
+    const response = await axios.get(`${API_BASE_URL}/health`, {
+      timeout: 5000, // 5 second timeout for health checks
+    });
     return response.data;
   } catch (error) {
+    console.error('Health check failed:', error);
+    console.error('Error details:', {
+      message: error.message,
+      code: error.code,
+      response: error.response?.data,
+      status: error.response?.status,
+      url: error.config?.url,
+      baseURL: API_BASE_URL,
+    });
     throw error;
   }
 };

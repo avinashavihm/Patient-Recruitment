@@ -21,10 +21,22 @@ function App() {
   const [serverStatus, setServerStatus] = useState('checking');
 
   useEffect(() => {
-    // Check server health on mount
-    checkHealth()
-      .then(() => setServerStatus('online'))
-      .catch(() => setServerStatus('offline'));
+    // Check server health on mount and periodically
+    const checkServer = async () => {
+      try {
+        await checkHealth();
+        setServerStatus('online');
+      } catch (error) {
+        console.error('Server health check failed:', error);
+        setServerStatus('offline');
+      }
+    };
+    
+    checkServer();
+    // Check every 5 seconds
+    const interval = setInterval(checkServer, 5000);
+    
+    return () => clearInterval(interval);
   }, []);
 
   const handleFileChange = (fileType, file) => {
@@ -160,6 +172,19 @@ function App() {
                   ? 'Server Offline'
                   : 'Checking...'}
               </span>
+              {serverStatus === 'offline' && (
+                <button
+                  onClick={() => {
+                    setServerStatus('checking');
+                    checkHealth()
+                      .then(() => setServerStatus('online'))
+                      .catch(() => setServerStatus('offline'));
+                  }}
+                  className="ml-2 text-xs text-blue-600 hover:text-blue-800 underline"
+                >
+                  Retry
+                </button>
+              )}
             </div>
           </div>
         </div>
