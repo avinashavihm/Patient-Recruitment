@@ -176,11 +176,3 @@ cd frontend
 npm run build
 # Serve the dist/ directory
 ```
-
-## License
-
-[Add your license here]
-
-## Support
-
-For issues and questions, please open an issue in the repository.
