@@ -1,6 +1,0 @@
-2025-10-15 13:10:21,122 - WARNING -  WARNING: agentops is out of date. Please update with the command: 'pip install --upgrade agentops'
-2025-10-15 13:10:22,964 - INFO - Session Replay: https://app.agentops.ai/drilldown?session_id=c32fb011-d85c-41c7-ae3e-99e96929a49f
-2025-10-15 13:30:07,016 - INFO - SIGINT detected. Ending session...
-2025-10-15 13:30:08,029 - INFO - SIGINT detected. Ending session...
-2025-10-15 13:30:10,374 - INFO - Analytics for this run - LLM calls: 0 | Tool calls: 0 | Actions: 0 | Errors: 0 | Duration: 19m 46.2s | Cost: $0.00
-2025-10-15 13:30:10,377 - INFO - Session Replay: https://app.agentops.ai/drilldown?session_id=c32fb011-d85c-41c7-ae3e-99e96929a49f
