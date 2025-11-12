@@ -22,13 +22,22 @@ function App() {
 
   useEffect(() => {
     // Check server health on mount and periodically
+    // But skip checks during processing to avoid false "offline" status
     const checkServer = async () => {
+      // Don't check health if we're currently processing
+      if (isProcessing) {
+        return;
+      }
+      
       try {
         await checkHealth();
         setServerStatus('online');
       } catch (error) {
         console.error('Server health check failed:', error);
-        setServerStatus('offline');
+        // Only set offline if we're not processing
+        if (!isProcessing) {
+          setServerStatus('offline');
+        }
       }
     };
     
@@ -37,7 +46,7 @@ function App() {
     const interval = setInterval(checkServer, 5000);
     
     return () => clearInterval(interval);
-  }, []);
+  }, [isProcessing]);
 
   const handleFileChange = (fileType, file) => {
     setFiles((prev) => ({ ...prev, [fileType]: file }));
@@ -59,6 +68,12 @@ function App() {
     setStatus('Preparing files...');
     setError(null);
     setResults(null);
+    // Set server status to processing to prevent health check from showing offline
+    setServerStatus('processing');
+
+    // Declare these outside try block so they can be cleared in catch
+    let progressInterval = null;
+    let progressTimeout = null;
 
     try {
       setStatus('Uploading files to server...');
@@ -72,14 +87,33 @@ function App() {
       setProgress(30);
       setStatus('Processing eligibility criteria...');
 
-      // Simulate processing progress (since we can't track actual processing)
-      const progressInterval = setInterval(() => {
+      // Simulate processing progress with better timing
+      // Progress from 30% to 90% over estimated time
+      const estimatedTime = 45000; // 45 seconds (allows for smaller batches)
+      const progressSteps = 60; // 60 steps from 30% to 90%
+      const stepInterval = estimatedTime / progressSteps;
+      
+      progressInterval = setInterval(() => {
         setProgress((prev) => {
-          if (prev < 90) return prev + 5;
+          if (prev < 90) {
+            const increment = 60 / progressSteps; // 60% range / steps
+            return Math.min(prev + increment, 90);
+          }
           return prev;
         });
-      }, 500);
+      }, stepInterval);
+      
+      // Safety timeout: if processing takes too long, stop progress simulation at 90%
+      progressTimeout = setTimeout(() => {
+        if (progressInterval) {
+          clearInterval(progressInterval);
+          progressInterval = null;
+        }
+        setProgress(90);
+        setStatus('Processing taking longer than expected...');
+      }, estimatedTime + 10000); // 10 seconds after estimated time
 
+      // Wait for the actual response (this will clear the interval when done)
       // Create a blob URL for the downloaded file
       const blob = new Blob([response.data], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -89,17 +123,26 @@ function App() {
         ? response.headers['content-disposition'].split('filename=')[1]?.replace(/"/g, '')
         : 'eligibility_results.xlsx';
 
-      clearInterval(progressInterval);
+      // Clear progress simulation
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
+      }
+      clearTimeout(progressTimeout);
       setProgress(90);
       setStatus('Generating results...');
 
       // Extract metadata from response
       const metadata = response.metadata || {};
       const counts = metadata.counts || {};
+      
+      console.log('Response metadata:', metadata);
+      console.log('Counts:', counts);
 
       setResults({
         downloadUrl: url,
         filename: filename,
+        blob: blob, // Pass the blob for Excel parsing
         counts: {
           patients: counts.patients || 0,
           eligible_true: counts.eligible_true || 0,
@@ -112,6 +155,12 @@ function App() {
       setStatus('Complete!');
     } catch (err) {
       console.error('Error processing pipeline:', err);
+      // Clear any running intervals/timeouts
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
+      }
+      clearTimeout(progressTimeout);
       setError(
         err.response?.data?.detail ||
         err.message ||
@@ -121,6 +170,12 @@ function App() {
       setProgress(null);
     } finally {
       setIsProcessing(false);
+      // Restore server status check after processing
+      setServerStatus('checking');
+      // Do a quick health check to restore status
+      checkHealth()
+        .then(() => setServerStatus('online'))
+        .catch(() => setServerStatus('offline'));
       setTimeout(() => {
         setProgress(null);
         setStatus('');
@@ -162,6 +217,8 @@ function App() {
                     ? 'bg-green-500'
                     : serverStatus === 'offline'
                     ? 'bg-red-500'
+                    : serverStatus === 'processing'
+                    ? 'bg-blue-500 animate-pulse'
                     : 'bg-yellow-500'
                 }`}
               />
@@ -170,9 +227,11 @@ function App() {
                   ? 'Server Online'
                   : serverStatus === 'offline'
                   ? 'Server Offline'
+                  : serverStatus === 'processing'
+                  ? 'Processing...'
                   : 'Checking...'}
               </span>
-              {serverStatus === 'offline' && (
+              {serverStatus === 'offline' && !isProcessing && (
                 <button
                   onClick={() => {
                     setServerStatus('checking');
@@ -285,10 +344,13 @@ function App() {
           </div>
         </div>
 
-        {/* Progress Section */}
+        {/* Progress Section - matching Streamlit's st.spinner */}
         {isProcessing && (
           <div className="card mb-8">
-            <h2 className="text-xl font-bold text-gray-900 mb-4">Processing</h2>
+            <div className="flex items-center space-x-3 mb-4">
+              <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+              <h2 className="text-xl font-bold text-gray-900">Processing...</h2>
+            </div>
             <ProgressBar
               progress={progress}
               status={status}
@@ -297,14 +359,14 @@ function App() {
           </div>
         )}
 
-        {/* Error Display */}
+        {/* Error Display - matching Streamlit's st.error */}
         {error && (
           <div className="card mb-8 bg-red-50 border-red-200">
             <div className="flex items-start space-x-3">
               <AlertCircle className="w-5 h-5 text-red-600 mt-0.5 flex-shrink-0" />
               <div>
-                <h3 className="font-semibold text-red-900 mb-1">Error</h3>
-                <p className="text-sm text-red-800">{error}</p>
+                <h3 className="font-semibold text-red-900 mb-1">Run failed</h3>
+                <p className="text-sm text-red-800 font-mono whitespace-pre-wrap">{error}</p>
               </div>
             </div>
           </div>

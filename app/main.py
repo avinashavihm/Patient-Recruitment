@@ -13,7 +13,11 @@ app = FastAPI(title="Patient Recruitment Agent (POC)", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["*"], 
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"],
+    expose_headers=["X-Metadata", "Content-Disposition"]  # Expose custom headers to frontend
 )
 @app.get("/", include_in_schema=False)
 @app.get("/health")

@@ -10,6 +10,26 @@ const api = axios.create({
   },
 });
 
+// Interceptor to handle blob error responses
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    // If error response is a blob (from responseType: 'blob'), convert it to JSON
+    if (error.response?.data instanceof Blob) {
+      const contentType = error.response.headers['content-type'];
+      if (contentType && contentType.includes('application/json')) {
+        try {
+          const text = await error.response.data.text();
+          error.response.data = JSON.parse(text);
+        } catch (parseErr) {
+          console.error('Failed to parse error response:', parseErr);
+        }
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
 export const runPipeline = async (files, onProgress) => {
   const formData = new FormData();
   
@@ -30,17 +50,32 @@ export const runPipeline = async (files, onProgress) => {
     },
   });
 
-  // Extract metadata from response headers (case-insensitive)
+  // Extract metadata from response headers
+  // Axios normalizes headers to lowercase, so check 'x-metadata'
+  let metadata = null;
   const metadataHeader = response.headers['x-metadata'] || 
                          response.headers['X-Metadata'] ||
                          response.headers['X-METADATA'];
-  let metadata = null;
+  
   if (metadataHeader) {
     try {
+      // Try parsing directly first
       metadata = JSON.parse(metadataHeader);
+      console.log('Successfully parsed metadata:', metadata);
     } catch (e) {
-      console.warn('Failed to parse metadata from headers:', e);
+      // If that fails, try URL decoding first
+      try {
+        metadata = JSON.parse(decodeURIComponent(metadataHeader));
+        console.log('Successfully parsed metadata (after URL decode):', metadata);
+      } catch (e2) {
+        console.warn('Failed to parse metadata from headers:', e2);
+        console.warn('Metadata header value:', metadataHeader);
+        console.warn('All response headers:', Object.keys(response.headers));
+      }
     }
+  } else {
+    console.warn('No metadata header found in response');
+    console.warn('Available headers:', Object.keys(response.headers));
   }
 
   return {

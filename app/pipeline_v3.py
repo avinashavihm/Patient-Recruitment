@@ -39,18 +39,86 @@ SITE_HISTORY_REQUIRED_COLS = ["siteId", "status", "screeningFailureRate"]
 
 
 # ----- Helpers -----
-def _read_excel_bytes(file_bytes: bytes) -> pd.DataFrame:
+def _read_excel_bytes(file_bytes: bytes, header_row: int = 0) -> pd.DataFrame:
     """Read a single-sheet .xlsx from raw bytes and normalize headers (trim spaces)."""
     buf = io.BytesIO(file_bytes)
-    df = pd.read_excel(buf, engine="openpyxl")
+    df = pd.read_excel(buf, engine="openpyxl", header=header_row)
     # Normalize column names by stripping whitespace
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
+def _read_excel_bytes_auto_header(file_bytes: bytes, expected_cols: List[str] = None) -> pd.DataFrame:
+    """Read Excel file, trying to auto-detect header row if first attempt fails."""
+    # First try with header=0 (first row)
+    df = _read_excel_bytes(file_bytes, header_row=0)
+    
+    # Check if we got "Unnamed" columns or if expected columns are missing
+    has_unnamed = any('Unnamed' in str(col) for col in df.columns)
+    missing_expected = False
+    
+    if expected_cols:
+        # Normalize and check if any expected columns are found
+        df_cols_norm = {_normalize_column_name(c) for c in df.columns}
+        expected_norm = {_normalize_column_name(c) for c in expected_cols}
+        missing_expected = len(expected_norm.intersection(df_cols_norm)) == 0
+    
+    # If we have "Unnamed" columns or missing expected columns, try header=1
+    if has_unnamed or missing_expected:
+        df = _read_excel_bytes(file_bytes, header_row=1)
+    
+    return df
+
+def _normalize_column_name(col: str) -> str:
+    """Normalize column name for comparison: lowercase, strip, replace spaces/underscores."""
+    return str(col).strip().lower().replace(' ', '_').replace('-', '_')
+
+def _find_column_mapping(df: pd.DataFrame, required_cols: List[str]) -> Dict[str, str]:
+    """Find case-insensitive column mappings."""
+    mapping = {}
+    df_cols_normalized = {_normalize_column_name(c): c for c in df.columns}
+    
+    for req_col in required_cols:
+        req_normalized = _normalize_column_name(req_col)
+        if req_normalized in df_cols_normalized:
+            mapping[req_col] = df_cols_normalized[req_normalized]
+        else:
+            # Try partial matches (e.g., "patient_id" matches "Patient ID" or "patientid")
+            for df_col_norm, df_col_orig in df_cols_normalized.items():
+                if req_normalized.replace('_', '') == df_col_norm.replace('_', ''):
+                    mapping[req_col] = df_col_orig
+                    break
+    return mapping
+
 def _validate_headers(df: pd.DataFrame, required_cols: List[str], context: str) -> None:
-    missing = [c for c in required_cols if c not in df.columns]
+    """Validate headers with case-insensitive matching and helpful error messages."""
+    missing = []
+    found_mapping = _find_column_mapping(df, required_cols)
+    
+    for req_col in required_cols:
+        if req_col not in found_mapping:
+            missing.append(req_col)
+    
     if missing:
-        raise ValueError(f"{context} missing required columns: {missing}. Found: {list(df.columns)}")
+        # Provide helpful suggestions
+        suggestions = []
+        for req_col in missing:
+            req_norm = _normalize_column_name(req_col)
+            similar = [c for c in df.columns if _normalize_column_name(c) == req_norm or 
+                      req_norm.replace('_', '') in _normalize_column_name(c).replace('_', '')]
+            if similar:
+                suggestions.append(f"  '{req_col}' might be: {similar}")
+        
+        error_msg = f"{context} missing required columns: {missing}.\n"
+        error_msg += f"Found columns: {list(df.columns)}\n"
+        if suggestions:
+            error_msg += "Similar column names found:\n" + "\n".join(suggestions)
+        error_msg += "\nTip: Ensure your Excel file has the correct column headers in the first row."
+        raise ValueError(error_msg)
+    
+    # Rename columns to standard names if they match (case-insensitive)
+    rename_map = {found_mapping[req]: req for req in required_cols if req in found_mapping}
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
 
 def _pretty_json_cell(obj: Dict[str, Any]) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False)
@@ -128,7 +196,6 @@ def run_pipeline(
     cache: Dict[str, Any] = {}
     # If you want a page range, pass start_page/end_page here
     # criteria_json = extract_or_load_criteria(pdf_bytes=pdf_bytes, cache_store=cache, start_page=37, end_page=41)
-    cache: Dict[str, Any] = {}
     criteria_text = extract_or_load_criteria_text(
         pdf_bytes=pdf_bytes,
         cache_store=cache,
@@ -136,10 +203,10 @@ def run_pipeline(
         end_page=41,
     )
 
-    # 2) Read Excel inputs (normalize headers)
-    patients_df = _read_excel_bytes(patients_xlsx)
-    map_df = _read_excel_bytes(map_xlsx)
-    site_hist_df = _read_excel_bytes(site_hist_xlsx)
+    # 2) Read Excel inputs (normalize headers, auto-detect header row)
+    patients_df = _read_excel_bytes_auto_header(patients_xlsx, expected_cols=PATIENT_REQUIRED_COLS)
+    map_df = _read_excel_bytes_auto_header(map_xlsx, expected_cols=MAPPING_REQUIRED_COLS)
+    site_hist_df = _read_excel_bytes_auto_header(site_hist_xlsx, expected_cols=SITE_HISTORY_REQUIRED_COLS)
 
     # 2a) Validate headers (relaxed for mapping, minimal for site history)
     _validate_headers(patients_df, PATIENT_REQUIRED_COLS, context="Patients.xlsx")
@@ -164,20 +231,6 @@ def run_pipeline(
     # 4) Build rosters (keep Site_ID = NULL if mapping is missing)
     # eligible_roster, all_roster = _build_rosters(elig_df=elig_df, map_df=map_df)
     eligible_roster, all_roster = _build_rosters(patients_df=patients_df, elig_df=elig_df, map_df=map_df)
-    meta = {
-    "errors": errors,
-    "counts": {
-        "patients": int(len(patients_df)),
-        "elig_rows": int(len(elig_df)),
-        "all_roster_rows": int(len(all_roster)),
-        "eligible_true": int((elig_df["eligible"] == True).sum()) if "eligible" in elig_df.columns else 0,
-        "inconclusive": int((elig_df["eligible"] == "Inconclusive").sum()) if "eligible" in elig_df.columns else 0,
-    },
-    # "debug": {
-    #     "prompt_head": DEBUG_CAPTURE.get("last_prompt_head", ""),
-    #     "resp_head": DEBUG_CAPTURE.get("last_resp_head", ""),
-    # },
-}
 
     # 5) Compute site ranking (Option A uses only siteId, status, screeningFailureRate)
     site_ranking = compute_site_ranking(elig_df=elig_df, map_df=map_df, site_hist_df=site_hist_df)
@@ -190,13 +243,21 @@ def run_pipeline(
         criteria_text=criteria_text,
     )
 
-    # 7) Metadata summary
+    # 7) Metadata summary - count eligible patients (handle both boolean True and string "True")
+    if "eligible" in elig_df.columns:
+        # Count True (boolean) or "True" (string) as eligible
+        eligible_count = int(((elig_df["eligible"] == True) | (elig_df["eligible"] == "True") | (elig_df["eligible"] == "true")).sum())
+        inconclusive_count = int(((elig_df["eligible"] == "Inconclusive") | (elig_df["eligible"] == "inconclusive")).sum())
+    else:
+        eligible_count = 0
+        inconclusive_count = 0
+    
     meta = {
         "errors": errors,
         "counts": {
             "patients": int(len(patients_df)),
-            "eligible_true": int((elig_df["eligible"] == True).sum()) if "eligible" in elig_df.columns else 0,
-            "inconclusive": int((elig_df["eligible"] == "Inconclusive").sum()) if "eligible" in elig_df.columns else 0,
+            "eligible_true": eligible_count,
+            "inconclusive": inconclusive_count,
         },
     }
     return xlsx_bytes, meta

@@ -26,8 +26,8 @@ class Settings:
 
 
     # --- Version 3 constants ---
-    # Eligibility batching
-    BATCH_SIZE: int = 25
+    # Eligibility batching (reduced to prevent response truncation)
+    BATCH_SIZE: int = 10
     LLM_TIMEOUT_SECS: int = 120
     LLM_MAX_RETRIES: int = 3
     ABORT_ON_CONTEXT_OVERFLOW: bool = True

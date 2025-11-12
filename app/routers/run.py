@@ -4,6 +4,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
 from datetime import datetime
 import json
+import traceback
 
 from ..config import settings
 from ..utils.fileio import ensure_dirs
@@ -40,15 +41,24 @@ async def run_pipeline_v3(
 
     # Run the v3 pipeline (criteria cache is in-memory per request)
     try:
+        print("[V3] Starting pipeline processing...")
         xlsx_bytes, meta = run_pipeline(
             pdf_bytes=pdf_bytes,
             patients_xlsx=patients_bytes,
             map_xlsx=mapping_bytes,
             site_hist_xlsx=site_hist_bytes,
         )
+        print("[V3] Pipeline completed successfully")
         print("[V3] META:", meta)
+    except KeyboardInterrupt:
+        print("[V3] Pipeline interrupted by user")
+        raise HTTPException(status_code=500, detail="Processing was interrupted")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+        # Log full traceback for debugging
+        error_traceback = traceback.format_exc()
+        print(f"[ERROR] Processing failed: {e}")
+        print(f"[ERROR] Full traceback:\n{error_traceback}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}\n\nTraceback:\n{error_traceback}")
 
     # Persist output to disk
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -76,7 +86,9 @@ async def run_pipeline_v3(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     # Add metadata to headers (JSON-encoded)
-    response.headers["X-Metadata"] = json.dumps(meta)
+    meta_json = json.dumps(meta)
+    response.headers["X-Metadata"] = meta_json
+    print(f"[V3] Sending metadata in headers: {meta_json[:200]}...")  # Log first 200 chars
     return response
 
 

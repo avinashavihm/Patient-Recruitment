@@ -136,15 +136,33 @@ def _build_batch_prompt(criteria_text: str, rows: List[Dict[str, Any]]) -> str:
 #     resp = model.generate_content(prompt)
 #     return (resp.text or "").strip()
 def _gemini_call(prompt: str) -> str:
-    model = genai.GenerativeModel(
-        model_name=settings.GEMINI_MODEL,
-        generation_config={
-            "temperature": settings.LLM_TEMPERATURE,
-            "max_output_tokens": settings.LLM_MAX_OUTPUT_TOKENS,
-            # REMOVE response_mime_type to avoid empty text edge case
-        },
-    )
-    resp = model.generate_content(prompt)
+    """Call Gemini API with timeout protection."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+    
+    def _call_api():
+        """Internal function to make the actual API call."""
+        model = genai.GenerativeModel(
+            model_name=settings.GEMINI_MODEL,
+            generation_config={
+                "temperature": settings.LLM_TEMPERATURE,
+                "max_output_tokens": settings.LLM_MAX_OUTPUT_TOKENS,
+            },
+        )
+        return model.generate_content(prompt)
+    
+    try:
+        # Use ThreadPoolExecutor for timeout handling (works on all platforms)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call_api)
+            try:
+                resp = future.result(timeout=settings.LLM_TIMEOUT_SECS)
+            except FutureTimeoutError:
+                future.cancel()
+                raise TimeoutError(f"Gemini API call timed out after {settings.LLM_TIMEOUT_SECS} seconds")
+    except TimeoutError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Gemini API call failed: {e}")
 
     # Join text from all parts across candidates
     chunks = []
@@ -233,25 +251,76 @@ def evaluate_in_batches(criteria_text: str, patients_df: pd.DataFrame) -> Tuple[
     import re
 
     def _extract_first_json_array(s: str):
-        """Return (list_obj, err_str_or_None) by extracting the first top-level JSON array from s."""
+        """Return (list_obj, err_str_or_None) by extracting the first top-level JSON array from s.
+        Tries to recover partial results if array is incomplete."""
         if not s:
             return None, "empty"
+        
+        # First, try to find and parse complete array
         # find first '[' followed by '{' (start of array of objects)
         m = re.search(r'\[\s*{', s, re.S)
         if not m:
             return None, "no_array_start"
         start = m.start()  # at '['
+        
+        # Try to find complete array by matching brackets
         depth = 0
+        array_end = -1
         for i, ch in enumerate(s[start:], start=start):
             if ch == '[':
                 depth += 1
             elif ch == ']':
                 depth -= 1
                 if depth == 0:
-                    try:
-                        return json.loads(s[start:i+1]), None
-                    except Exception as e:
-                        return None, f"json_parse:{e}"
+                    array_end = i + 1
+                    break
+        
+        # If we found a complete array, try to parse it
+        if array_end > start:
+            try:
+                return json.loads(s[start:array_end]), None
+            except Exception as e:
+                # Array structure looks complete but JSON is invalid, continue to recovery
+                pass
+        
+        # Recovery: Try to extract complete objects from incomplete array
+        # Find all complete JSON objects in the string
+        objects = []
+        i = start + 1  # Start after '['
+        while i < len(s):
+            # Find next '{'
+            obj_start = s.find('{', i)
+            if obj_start == -1:
+                break
+            
+            # Try to find matching '}'
+            obj_depth = 0
+            obj_end = -1
+            for j in range(obj_start, len(s)):
+                if s[j] == '{':
+                    obj_depth += 1
+                elif s[j] == '}':
+                    obj_depth -= 1
+                    if obj_depth == 0:
+                        obj_end = j + 1
+                        break
+            
+            if obj_end > obj_start:
+                # Try to parse this object
+                try:
+                    obj_str = s[obj_start:obj_end]
+                    obj = json.loads(obj_str)
+                    objects.append(obj)
+                    i = obj_end
+                except:
+                    i = obj_start + 1
+            else:
+                break
+        
+        # If we found any complete objects, return them
+        if objects:
+            return objects, None
+        
         return None, "unterminated_array"
 
     if "Patient_ID" not in patients_df.columns:
@@ -261,28 +330,69 @@ def evaluate_in_batches(criteria_text: str, patients_df: pd.DataFrame) -> Tuple[
     outputs: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    for start in range(0, len(df), settings.BATCH_SIZE):
+    total_batches = (len(df) + settings.BATCH_SIZE - 1) // settings.BATCH_SIZE
+    
+    for batch_num, start in enumerate(range(0, len(df), settings.BATCH_SIZE), 1):
         chunk = df.iloc[start : start + settings.BATCH_SIZE].copy()
         rows = chunk.to_dict(orient="records")
         prompt = _build_batch_prompt(criteria_text, rows)
-        resp_text = _gemini_call(prompt)
-        print("gemini response\n")
-        print(resp_text[:200])
-        try:
-            resp_text = _gemini_call(prompt)
-        except Exception as e:
-            errors.append(f"Batch {start}-{start+len(chunk)-1} failed: {e}")
-            for r in rows:
-                outputs.append({
-                    "patient_id": r.get("Patient_ID"),
-                    "eligible": "Inconclusive",
-                    "reasons": [],
-                    "missing": ["LLM call failure"],
-                    "confidence": None,
-                })
-            continue
+        
+        print(f"[Batch {batch_num}/{total_batches}] Processing patients {start} to {start+len(chunk)-1}...")
+        
+        # Retry logic for empty responses
+        max_retries = 2
+        resp_text = None
+        for retry in range(max_retries + 1):
+            try:
+                resp_text = _gemini_call(prompt)
+                print(f"[Batch {batch_num}/{total_batches}] Received response ({len(resp_text)} chars)")
+                if resp_text and resp_text.strip():  # If we got a non-empty response, break
+                    break
+                elif retry < max_retries:
+                    print(f"[Batch {batch_num}/{total_batches}] Empty response, retrying ({retry + 1}/{max_retries})...")
+                    import time
+                    time.sleep(1)  # Brief delay before retry
+            except TimeoutError as e:
+                error_msg = f"Batch {start}-{start+len(chunk)-1} timed out after {settings.LLM_TIMEOUT_SECS}s: {e}"
+                print(f"[ERROR] {error_msg}")
+                if retry == max_retries:  # Only add error and mark as inconclusive on final retry
+                    errors.append(error_msg)
+                    for r in rows:
+                        outputs.append({
+                            "patient_id": r.get("Patient_ID"),
+                            "eligible": "Inconclusive",
+                            "reasons": [],
+                            "missing": ["LLM call timeout"],
+                            "confidence": None,
+                        })
+                    break
+                elif retry < max_retries:
+                    print(f"[Batch {batch_num}/{total_batches}] Retrying after timeout ({retry + 1}/{max_retries})...")
+                    import time
+                    time.sleep(2)  # Longer delay for timeouts
+                continue
+            except Exception as e:
+                error_msg = f"Batch {start}-{start+len(chunk)-1} failed: {e}"
+                print(f"[ERROR] {error_msg}")
+                if retry == max_retries:  # Only add error and mark as inconclusive on final retry
+                    errors.append(error_msg)
+                    for r in rows:
+                        outputs.append({
+                            "patient_id": r.get("Patient_ID"),
+                            "eligible": "Inconclusive",
+                            "reasons": [],
+                            "missing": ["LLM call failure"],
+                            "confidence": None,
+                        })
+                    break
+                elif retry < max_retries:
+                    print(f"[Batch {batch_num}/{total_batches}] Retrying after error ({retry + 1}/{max_retries})...")
+                    import time
+                    time.sleep(2)  # Longer delay for errors
+                continue
 
-        if not resp_text:
+        # Check if we still have an empty response after retries
+        if not resp_text or not resp_text.strip():
             errors.append(f"Batch {start}-{start+len(chunk)-1} empty response (likely prompt too large).")
             for r in rows:
                 outputs.append({
@@ -314,11 +424,13 @@ def evaluate_in_batches(criteria_text: str, patients_df: pd.DataFrame) -> Tuple[
                     "confidence": None,
                 })
             continue
-        print("Parsed text \n")
-        print(parsed)
-#        print(resp_text[:300])
-        if len(parsed) != len(rows):
-            errors.append(f"Batch {start}-{start+len(chunk)-1} length mismatch: got {len(parsed)} vs {len(rows)}")
+        
+        # Log if we got partial results (fewer than expected)
+        if len(parsed) < len(rows):
+            print(f"[WARNING] Batch {start}-{start+len(chunk)-1} got partial results: {len(parsed)}/{len(rows)} patients")
+            errors.append(f"Batch {start}-{start+len(chunk)-1} partial results: got {len(parsed)}/{len(rows)} (response may have been truncated)")
+        
+        print(f"[Batch {batch_num}/{total_batches}] Parsed {len(parsed)} results")
 
         # Push items THROUGH AS-IS (only ensure we have a patient_id)
         for idx in range(len(rows)):
